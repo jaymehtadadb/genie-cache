@@ -1,0 +1,18 @@
+{
+  "name": "genie-cache",
+  "version": "0.1.0",
+  "description": "Plug-and-play semantic caching proxy for Databricks Genie spaces. Creates a Lakebase Postgres instance (or reuses one), provisions pg_vector exact + semantic cache tables with TTL and periodic cleanup, and deploys a FastAPI proxy as a Databricks App so every /ask request first checks the cache before falling back to the Genie Conversations API.",
+  "author": {
+    "name": "Jay Mehta",
+    "email": "jay.mehta@databricks.com"
+  },
+  "keywords": [
+    "databricks",
+    "genie",
+    "lakebase",
+    "pgvector",
+    "semantic-cache",
+    "caching",
+    "foundation-models"
+  ]
+}

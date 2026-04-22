@@ -1,0 +1,32 @@
+command:
+  - "uvicorn"
+  - "app:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
+
+env:
+  - name: GENIE_SPACE_ID
+    value: "__GENIE_SPACE_ID__"
+  - name: LAKEBASE_INSTANCE_NAME
+    value: "__LAKEBASE_INSTANCE_NAME__"
+  - name: PGSSLMODE
+    value: "require"
+  - name: EMBEDDING_ENDPOINT
+    value: "__EMBEDDING_ENDPOINT__"
+  - name: SEMANTIC_SIMILARITY_THRESHOLD
+    value: "__SIMILARITY_THRESHOLD__"
+  - name: GENIE_POLL_INTERVAL_SECONDS
+    value: "1.0"
+  - name: GENIE_POLL_TIMEOUT_SECONDS
+    value: "120"
+  # Cache freshness: rows expire after this many seconds. 0 disables TTL (rows never expire).
+  - name: CACHE_TTL_SECONDS
+    value: "__CACHE_TTL_SECONDS__"
+  # How often the background task deletes expired rows. 0 disables cleanup loop.
+  - name: CACHE_CLEANUP_INTERVAL_SECONDS
+    value: "__CACHE_CLEANUP_INTERVAL_SECONDS__"
+  # Cap the number of result rows inlined into the cached JSONB payload. 0 = unlimited.
+  - name: CACHE_MAX_RESULT_ROWS
+    value: "__CACHE_MAX_RESULT_ROWS__"
