@@ -92,6 +92,9 @@ Hits `/health`, `/stats`, and `POST /ask` twice against the deployed app. The se
 genie-cache-plugin/
 ├── .claude-plugin/plugin.json       Plugin manifest
 ├── README.md                        This file
+├── notebooks/                      Embedded path — caching inside a notebook, no app
+│   ├── README.md
+│   └── genie_cache_embedded.py     Databricks source notebook
 └── skills/
     ├── genie-cache-install/         Installer — scaffolds Lakebase + app
     │   ├── SKILL.md
@@ -105,6 +108,13 @@ genie-cache-plugin/
     └── genie-cache-tune/            SIMILARITY_THRESHOLD tuner
         └── SKILL.md
 ```
+
+## Two deployment paths
+
+- **App-based (`skills/genie-cache-install/`)** — deploys a FastAPI proxy as a Databricks App. Multiple callers share the cache via HTTP. Use when cache state should outlive any one notebook/job.
+- **Embedded (`notebooks/`)** — drops caching helpers directly into a notebook and rewrites `query_genie()` in place. No app, no service principal dance. Use when you just want to cache calls from your own client code.
+
+Both paths target the same Lakebase schema, so you can switch between them without re-provisioning the database.
 
 ## License
 
