@@ -24,6 +24,25 @@ Client ── /ask ──▶ FastAPI proxy (Databricks App)
 
 The proxy checks the exact cache first, then the semantic cache (cosine similarity ≥ `SIMILARITY_THRESHOLD`), and only calls Genie on a miss. Misses are written to both caches with an `expires_at` = now + `CACHE_TTL_SECONDS`. A background task runs every `CACHE_CLEANUP_INTERVAL_SECONDS` and deletes expired rows.
 
+### Decision flow
+
+```mermaid
+flowchart TD
+    Q["POST /ask<br/>{question}"] --> BYPASS{bypass_cache?}
+    BYPASS -->|yes| GENIE
+    BYPASS -->|no| EXACT["cache.exact_cache<br/>SHA-256 lookup"]
+    EXACT -->|hit, not expired| RET_E["source=exact_cache<br/>~5 ms"]
+    EXACT -->|miss| EMBED["embed(question)<br/>databricks-gte-large-en"]
+    EMBED --> SEM["cache.semantic_cache<br/>ORDER BY embedding <=> query"]
+    SEM --> THR{"similarity ≥<br/>SIMILARITY_THRESHOLD?"}
+    THR -->|yes| RET_S["source=semantic_cache<br/>~30 ms"]
+    THR -->|no| GENIE["Genie Conversations API<br/>(10-30 s)"]
+    GENIE --> WRITE["write-back to both caches<br/>expires_at = NOW() + TTL"]
+    WRITE --> RET_G["source=genie"]
+```
+
+The three return paths map one-to-one to the `source` field in the `/ask` response — every answer is self-describing about which layer served it. See [`docs/architecture.md`](docs/architecture.md) for the full picture (sequence diagrams, schema, deployment topology, design decisions).
+
 ## Prerequisites
 
 - **Databricks workspace** that supports Apps + Lakebase (FE-VM serverless, or any workspace with Lakebase enabled).
@@ -91,10 +110,13 @@ Hits `/health`, `/stats`, and `POST /ask` twice against the deployed app. The se
 ```
 genie-cache-plugin/
 ├── .claude-plugin/plugin.json       Plugin manifest
-├── README.md                        This file
-├── notebooks/                      Embedded path — caching inside a notebook, no app
+├── README.md                        This file — overview + decision flow + API ref
+├── docs/
+│   ├── architecture.md              Full system + decision + sequence diagrams
+│   └── setup.md                     Install steps for both paths + troubleshooting
+├── notebooks/                       Embedded path — caching inside a notebook, no app
 │   ├── README.md
-│   └── genie_cache_embedded.py     Databricks source notebook
+│   └── genie_cache_embedded.py      Databricks source notebook
 └── skills/
     ├── genie-cache-install/         Installer — scaffolds Lakebase + app
     │   ├── SKILL.md
@@ -115,6 +137,103 @@ genie-cache-plugin/
 - **Embedded (`notebooks/`)** — drops caching helpers directly into a notebook and rewrites `query_genie()` in place. No app, no service principal dance. Use when you just want to cache calls from your own client code.
 
 Both paths target the same Lakebase schema, so you can switch between them without re-provisioning the database.
+
+## API reference
+
+The app exposes five HTTP endpoints. Everything is JSON in / JSON out.
+
+### `POST /ask`
+
+Primary entry point. Runs the decision flow above.
+
+**Request**
+
+```json
+{
+  "question": "What were our top 5 regions by revenue last quarter?",
+  "space_id": "01f11821c34b1783b8c13e2a0c1b752a",
+  "bypass_cache": false
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `question` | string | yes | 1–2000 chars. |
+| `space_id` | string | no | Overrides `GENIE_SPACE_ID` from env. |
+| `bypass_cache` | bool | no | Skip both caches; always call Genie. Still write-back on return. |
+
+**Response**
+
+```json
+{
+  "question": "What were our top 5 regions by revenue last quarter?",
+  "source": "semantic_cache",
+  "response": {
+    "sql": "SELECT region, SUM(revenue) ...",
+    "rows": [["NA", 1234567.0], ["EMEA", 987654.0]],
+    "columns": ["region", "revenue"],
+    "conversation_id": "..."
+  },
+  "latency_ms": 32,
+  "matched_question": "Top regions by revenue Q4",
+  "similarity": 0.87
+}
+```
+
+| Field | Type | When populated |
+|---|---|---|
+| `source` | `"exact_cache"` \| `"semantic_cache"` \| `"genie"` | Always. |
+| `matched_question` | string | Semantic hits only. |
+| `similarity` | float | Semantic hits only (0–1 cosine similarity). |
+| `latency_ms` | int | Always. |
+
+### `GET /health`
+
+```json
+{"status": "ok", "space_id": "01f11821c34b1783b8c13e2a0c1b752a"}
+```
+
+### `GET /stats`
+
+```json
+{
+  "exact":    {"total_rows": 1240, "expired_rows": 12, "total_hits": 8430},
+  "semantic": {"total_rows": 1240, "expired_rows": 12, "total_hits": 2150},
+  "ttl_seconds": 86400,
+  "max_result_rows": 100
+}
+```
+
+### `POST /admin/cleanup`
+
+Manually triggers the TTL sweep. Returns deletion counts.
+
+```json
+{"exact_deleted": 12, "semantic_deleted": 12}
+```
+
+### `GET /api/info`
+
+Self-describing manifest of all endpoints — handy when pointing a new tool at the proxy.
+
+## Key design decisions
+
+1. **Two caches, not one.** Exact match is sub-5 ms and handles "same user reruns the same question" for free. Semantic catches rephrasings at ~30 ms. Cheap path wins when it can.
+2. **Write-through, not write-behind.** Genie calls are 10-30 s; the extra write latency is rounding error, and we never risk silent cache rot.
+3. **`expires_at` column, not native TTL.** Portable, cheap, lets `NULL` mean "never expire" without schema changes.
+4. **HNSW over IVFFlat.** No training corpus, no `lists` tuning — good recall out of the box under 1M rows.
+5. **`max_lifetime=2700` on the pool.** Lakebase OAuth tokens expire at 1 h; default `3600` creates a race. Recycling at 45 min leaves 15 min of headroom.
+6. **`SIMILARITY_THRESHOLD` default 0.80.** Break-even between hit rate and false positives on Genie rephrasing patterns. The `genie-cache-tune` skill helps tune it per workload.
+
+Full rationale and more decisions in [`docs/architecture.md`](docs/architecture.md#key-design-decisions).
+
+## Known limitations
+
+- **Single Genie space per app.** `GENIE_SPACE_ID` is startup-resolved; multi-tenant routing means running multiple app instances.
+- **Multi-turn conversations bypass the cache.** Follow-ups like "now break it down by region" depend on parent context and aren't cached.
+- **No user-scoped cache.** All callers share the same keys — row-level security must live upstream in Genie / the SQL warehouse, not here.
+- **Result-row cap.** `CACHE_MAX_RESULT_ROWS` (default 100) caps inlined rows per cached response. Larger result sets cache the SQL only.
+- **`VECTOR(1024)` is fixed.** Switching embedding models means dropping `cache.semantic_cache`.
 
 ## License
 
