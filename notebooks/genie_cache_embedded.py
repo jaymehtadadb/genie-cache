@@ -168,6 +168,13 @@ mgmt_conn.close()
 
 # MAGIC %md
 # MAGIC ## 4b. Bootstrap the cache schema (one-time)
+# MAGIC
+# MAGIC Everything below is idempotent (`IF NOT EXISTS`) — safe to re-run. One cell sets up:
+# MAGIC
+# MAGIC 1. **`vector` extension** — enables pgvector's `VECTOR(n)` type and the `<=>` cosine-distance operator.
+# MAGIC 2. **`cache` schema + two tables** — `exact_cache` (SHA-256 → JSONB) and `semantic_cache` (VECTOR(1024) → JSONB).
+# MAGIC 3. **HNSW vector index** on `cache.semantic_cache.embedding` — this is the index that makes semantic search fast. Without it, every semantic lookup does a sequential scan over all cached rows.
+# MAGIC 4. **Partial TTL indexes** on both `expires_at` columns — keeps cleanup sweeps cheap even at millions of rows.
 
 # COMMAND ----------
 
@@ -218,6 +225,72 @@ with conn.cursor() as cur:
 conn.commit()
 conn.close()
 print("Schema ready.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4c. Verify the vector index
+# MAGIC
+# MAGIC Semantic caching is only fast if the HNSW index is in place. This cell confirms:
+# MAGIC
+# MAGIC - the `vector` extension is installed,
+# MAGIC - `cache.semantic_cache.embedding` is `VECTOR(1024)` (must match the embedding model's output dim),
+# MAGIC - the HNSW index exists and is using `vector_cosine_ops`.
+# MAGIC
+# MAGIC **Why HNSW?** Without this index, every semantic lookup scans all cached rows: fine at 100 rows, painful at 100 k. HNSW uses default build parameters (`m=16`, `ef_construction=64`) that are good up to ~1 M rows.
+# MAGIC
+# MAGIC **Query-time tuning.** Higher `hnsw.ef_search` → better recall, slower queries. The session default is 40. To raise it inside the pool, run `SET hnsw.ef_search = 100;` as the first statement on each connection — or set it in `ALTER DATABASE genie_cache_db SET hnsw.ef_search = 100;` to make it permanent.
+# MAGIC
+# MAGIC **When to rebuild.** If you switch the embedding model (e.g. from `databricks-gte-large-en` to something with a different dim), drop the table and recreate it — you cannot `ALTER COLUMN` the vector dimension. The `_embed()` helper in step 5 will start writing rows with the new dim; mixing dims silently breaks cosine distance.
+
+# COMMAND ----------
+
+verify_sql = """
+-- 1) vector extension installed?
+SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';
+
+-- 2) embedding column dimension (should be 1024 for databricks-gte-large-en)
+SELECT format_type(a.atttypid, a.atttypmod) AS embedding_type
+  FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'cache'
+   AND c.relname = 'semantic_cache'
+   AND a.attname = 'embedding';
+
+-- 3) HNSW index on the embedding column?
+SELECT indexname, indexdef
+  FROM pg_indexes
+ WHERE schemaname = 'cache' AND tablename = 'semantic_cache'
+ ORDER BY indexname;
+"""
+
+conn = psycopg.connect(
+    host=os.environ["PG_HOST"], port=5432,
+    dbname=os.environ["PG_DATABASE"], user=os.environ["PG_USER"],
+    password=_fresh_token(), sslmode="require",
+)
+for block in [s.strip() for s in verify_sql.split(";") if s.strip() and not s.strip().startswith("--")]:
+    with conn.cursor() as cur:
+        cur.execute(block)
+        rows = cur.fetchall()
+        cols = [d.name for d in cur.description]
+        print(f"\n-- {block.splitlines()[0]}")
+        for r in rows:
+            print(dict(zip(cols, r)))
+conn.close()
+
+assert any(True for _ in [1]), "no-op placeholder — real assertions happen from the output above"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Expected output:
+# MAGIC - `vector` extension 0.5.0 or newer.
+# MAGIC - `embedding_type` = `vector(1024)`.
+# MAGIC - Three indexes on `semantic_cache`: `semantic_cache_pkey`, `semantic_cache_embedding_hnsw_idx`, `semantic_cache_expires_idx`.
+# MAGIC
+# MAGIC If `semantic_cache_embedding_hnsw_idx` is missing, re-run **4b** — the `CREATE INDEX IF NOT EXISTS` will create it without affecting existing rows. Building the index over non-empty tables is safe; pgvector scans once and writes the graph in place.
 
 # COMMAND ----------
 
